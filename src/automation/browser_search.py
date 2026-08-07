@@ -446,7 +446,7 @@ async def _extract_from_page(page, url: str, fallback_title: str) -> dict:
     }
 
 
-_BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _PROFILE_DIR = os.path.join(_BASE_DIR, ".chrome_profile")
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
