@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
 
-from src.automation.browser_search import search_and_scrape
+from automation.browser_search import search_and_scrape
 
 app = FastAPI(
     title="LeadGen - Google AI Mode Search",
