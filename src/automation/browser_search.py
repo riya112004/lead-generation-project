@@ -74,14 +74,6 @@ def _clean_phones(raw: set) -> list[str]:
     return out[:5]
 
 
-async def _page_text(page) -> str:
-    try:
-        text = await page.locator("body").inner_text(timeout=5000)
-    except Exception:
-        text = ""
-    return text[:20000]
-
-
 _CARD_RE = re.compile(
     r"(?ms)^(?P<name>[^\n]{3,80})\n"
     r"(?P<rating>\d(?:\.\d)?)\n"
@@ -94,7 +86,7 @@ _CARD_RE = re.compile(
 _PROSE_RE = re.compile(
     r"(?m)^(?P<name>[^\n:]{3,80}): Rated (?P<rating>\d(?:\.\d)?)/5 "
     r"stars \((?P<reviews>[\d,.]+[Kk]?[^)]*)\)\. Located at "
-    r"(?P<address>.*?\.) "
+    r"(?P<address>.*?)(?:\.\s+(?=[A-Z][a-z])|\.\s*$|$)"
     r"(?P<body>.*)$"
 )
 
@@ -102,10 +94,21 @@ _PROSE_RE = re.compile(
 # business list sections, e.g. "Location: ..." / "Specialty: ...".
 _BUSINESS_LABEL_RE = re.compile(
     r"^(?:location|address|specialty|specialities|specialization|"
-    r"specializations|services|service|rating|reviews?|phone|phone number|"
-    r"contact|contact (?:&|and) details|contact details|details|website|site|"
+    r"specializations|services|services provided|service|rating|reviews?|"
+    r"phone|phone number|"
+    r"contact|contact (?:&|and) details|contact\s*(?:/|&|and)\s*\w+|"
+    r"contact details|details|website|site|"
     r"timing|timings|hours|price|price range|highlights|category|cuisine|"
     r"email|founded|known for|best for|must try|signature|open|closes)\s*:",
+    re.I,
+)
+
+_CONTINUATION_CUT_RE = re.compile(
+    r"(?:\s+\|\s+"
+    r"|\b(?:justdial|sulekha|indiamart|zaubacorp|linkedin|facebook|instagram|"
+    r"youtube|wikipedia|yellow pages?|practo|hotfrog|yelp|asklaila|show all)\b"
+    r"|\bai mode response is ready\b"
+    r"|^[+]\d[\d\s().-]*)",
     re.I,
 )
 
@@ -121,7 +124,8 @@ _NAME_SKIP_RE = re.compile(
     r"show all|magicpin\b|sulekha\b|indiamart\b|more to explore|"
     r"top bpo|top software|top it|popular bpo|"
     r"ai can make|double[- ]?check|if you tell me|let me know|"
-    r"are you searching for these)",
+    r"are you searching for these|"
+    r"\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{2,4})",
     re.I,
 )
 
@@ -132,6 +136,24 @@ _LEAD_NAME_JUNK_RE = re.compile(
     r"more to explore)",
     re.I,
 )
+
+_NAME_SUFFIX_JUNK_RE = re.compile(
+    r"(?:\s*(?:[-–—|:;,./]\s*)?(?:overview|details|profile|info|information|"
+    r"reviews?|rating|photos?|timings?|contact|address|location|website|"
+    r"more|listings?|official website|specialties|specialities))\s*$",
+    re.I,
+)
+
+
+def _clean_business_name(name: str) -> str:
+    """Strip Google UI headings / citation fragments glued to a business name
+    (e.g. 'Cyberbells ITES Services Overview' -> 'Cyberbells ITES Services')."""
+    name = (name or "").strip()
+    prev = None
+    while prev != name:
+        prev = name
+        name = _NAME_SUFFIX_JUNK_RE.sub("", name).strip()
+    return name
 
 
 def _parse_label_blocks(text: str) -> list[dict]:
@@ -178,6 +200,8 @@ def _parse_label_blocks(text: str) -> list[dict]:
                 current = {"business_name": ln}
                 blocks.append(current)
                 last_label = None
+            elif _CONTINUATION_CUT_RE.search(ln):
+                last_label = None
             elif last_label and not _NAME_SKIP_RE.match(ln) and len(ln) < 200 \
                     and not ln.endswith("?"):
                 prev = current.get(last_label) or ""
@@ -206,6 +230,72 @@ def _parse_label_blocks(text: str) -> list[dict]:
     return blocks
 
 
+_DASH_LEAD_RE = re.compile(
+    r"^(?P<name>[^\n]{3,80}?)\s+[-–—]\s+(?P<body>.+)$",
+    re.MULTILINE,
+)
+_DASH_LOC_PATTERN = re.compile(
+    r"(?:located\s+(?:at|on|in)|situated\s+(?:at|on|in)|based\s+(?:out\s+of|in|at)|"
+    r"headquartered\s+(?:at|in)|operating\s+(?:in|from|out\s+of)|"
+    r"with\s+strong\s+roots\s+in)\s+(.*)",
+    re.I,
+)
+
+
+def _extract_dash_address(body: str) -> str:
+    """Pull the address out of a dash-list description. Stops at the first
+    comma that starts a lowercase clause ('specializing in ...', 'offering
+    ...') so trailing description text is not glued into the address."""
+    m = _DASH_LOC_PATTERN.search(body or "")
+    if not m:
+        return ""
+    parts = [p.strip() for p in m.group(1).split(",")]
+    kept = [parts[0]]
+    for p in parts[1:]:
+        if p and p[0].isupper():
+            kept.append(p)
+        else:
+            break
+    addr = " ".join(x.strip(" .") for x in kept).strip()
+    if addr.lower().startswith("the "):
+        addr = addr[4:].strip()
+    return addr
+
+
+def _parse_dash_lines(text: str) -> list[dict]:
+    """Parse 'Name – description' style lists Google AI Overview emits, e.g.
+    'Trantor Software Pvt. Ltd. – Located at Plot No. 52, Industrial Area
+    Phase II, specializing in enterprise technology solutions.'"""
+    leads: list[dict] = []
+    for m in _DASH_LEAD_RE.finditer(text or ""):
+        name = " ".join(m.group("name").split()).strip(" .-–—|")
+        body = " ".join(m.group("body").split())
+        if not name or not body or len(name) < 3:
+            continue
+        if _NAME_SKIP_RE.match(name) or _LEAD_NAME_JUNK_RE.search(name):
+            continue
+        address = _extract_dash_address(body)
+        phones = _clean_phones(set(_PHONE_RE.findall(body)))
+        emails = _clean_emails(set(_EMAIL_RE.findall(body)))
+        leads.append({
+            "business_name": name,
+            "rating": "",
+            "reviews": "",
+            "category": "",
+            "price_range": "",
+            "status": "",
+            "address": address,
+            "timing": "",
+            "services": "",
+            "highlights": "",
+            "website": "",
+            "email": emails[0] if emails else "",
+            "phone": phones[0] if phones else "",
+            "description": body,
+        })
+    return leads
+
+
 def _merge_ai_leads(leads: list[dict]) -> list[dict]:
     merged: dict[str, dict] = {}
     for lead in leads:
@@ -220,42 +310,6 @@ def _merge_ai_leads(leads: list[dict]) -> list[dict]:
                 if v and not merged[key].get(k):
                     merged[key][k] = v
     return list(merged.values())
-
-
-_JUNK_HOSTS = {
-    "99acres.com", "magicbricks.com", "housing.com", "commonfloor.com",
-    "makaan.com", "homziio.com", "indiamart.com", "justdial.com",
-    "sulekha.com", "urbanpro.com", "practo.com", "yellowpages.com",
-    "indiaproperty.com", "squareyards.com", "nobroker.in",
-    "linkedin.com", "facebook.com", "instagram.com", "x.com",
-    "twitter.com", "youtube.com", "wikipedia.org", "en.wikipedia.org",
-    "blogspot.com", "wordpress.com", "medium.com", "quora.com", "reddit.com",
-    "estatedrive.co.in", "propertybulbul.com", "realtypromoo.com",
-    "readyhomz.com", "nic.in", "propertywala.com", "proptiger.com",
-    "housingnews.co.in", "magicindia.com", "constructionworld.in",
-    "reallybuzz.com", "realtynxt.com", "propertyjab.com",
-    "magicpin.in", "buzzook.com", "bharatbiz.com", "franchiseindia.com",
-    "asklaila.com", "getit.in", "yellowpages.in", "yellowpagesindia.com",
-    "glassdoor.com", "glassdoor.co.in", "indeed.com", "naukri.com",
-    "shine.com", "monster.com", "ambitionbox.com", "foundit.in",
-    "timesjobs.com", "internshala.com", "carriermine.com", "cutshort.io",
-    "instahyre.com", "hirect.in", "jobvite.com", "talent.com",
-    "zaubacorp.com", "tofler.in", "indiancompanylookup.com",
-    "thecompanycheck.com", "companyinfoz.com", "indiancompanies.in",
-}
-
-
-def _is_junk_source(title: str, url: str) -> bool:
-    try:
-        host = (url.split("/")[2] or "").lower()
-    except IndexError:
-        host = ""
-    if host.startswith("www."):
-        host = host[4:]
-    if any(host == h or host.endswith("." + h) for h in _JUNK_HOSTS):
-        return True
-    low = (url + " " + (title or "")).lower()
-    return "/blog" in low or low.startswith("blog.")
 
 
 _CARD_BODY_STOP_RE = re.compile(
@@ -390,6 +444,7 @@ def _parse_ai_business_cards(ai_text: str) -> list[dict]:
         prev = end
     masked += text[prev:]
     leads.extend(_parse_label_blocks(masked))
+    leads.extend(_parse_dash_lines(masked))
     merged = _merge_ai_leads(leads)
     detail_fields = (
         "rating", "reviews", "location", "address", "specialty", "services",
@@ -401,49 +456,11 @@ def _parse_ai_business_cards(ai_text: str) -> list[dict]:
         and not _LEAD_NAME_JUNK_RE.search(lead.get("business_name") or "")
     ]
     for lead in merged:
+        lead["business_name"] = _clean_business_name(
+            lead.get("business_name") or "")
         if not lead.get("description") and lead.get("specialty"):
             lead["description"] = lead["specialty"]
     return merged
-
-
-async def _extract_from_page(page, url: str, fallback_title: str) -> dict:
-    try:
-        title = (await page.title()).strip() or fallback_title
-    except Exception:
-        title = fallback_title
-    try:
-        h1 = await page.locator("h1").first.inner_text(timeout=3000)
-        h1 = " ".join(h1.split())
-        if h1 and len(h1) < 90:
-            title = h1
-    except Exception:
-        pass
-    text = await _page_text(page)
-    description = ""
-    try:
-        description = (
-            await page.locator('meta[name="description"]').get_attribute(
-                "content", timeout=3000
-            )
-        ) or ""
-    except Exception:
-        pass
-    if not description:
-        snippet = " ".join(text.split())[:220]
-        if snippet:
-            description = snippet
-    emails = _clean_emails(set(_EMAIL_RE.findall(text)))
-    phones = _clean_phones(set(_PHONE_RE.findall(text)))
-    return {
-        "business_name": title,
-        "website": url,
-        "email": emails[0] if emails else "",
-        "phone": phones[0] if phones else "",
-        "emails": emails,
-        "phones": phones,
-        "description": description,
-        "source": [f"{url.split('/')[2]}"],
-    }
 
 
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -493,7 +510,9 @@ _AI_ANSWER_JS = """(query) => {
         let cut = false;
         for (const m of ['Ask a follow-up', 'Suggested follow-up', 'Follow-up suggestions',
                          'Related searches', 'More to explore', 'Feedback', 'Report an issue',
-                         'Start a new topic']) {
+                         'Start a new topic', 'If you are looking', 'Are you looking',
+                         'AI can make mistakes', 'Show all', 'AI Mode response is ready',
+                         'To help narrow down', 'What is your core objective']) {
             if (line.indexOf(m) === 0) { cut = true; break; }
         }
         if (cut) break;
@@ -520,6 +539,57 @@ _AI_OVERVIEW_JS = """() => {
     }
     return '';
 }"""
+
+
+_AI_TRAILING_CUT_RE = re.compile(
+    r"^(?:if you are looking|are you looking|if you meant|ai can make mistakes|"
+    r"show all|ai mode response is ready|related searches|more to explore|"
+    r"feedback|report an issue|suggested follow-up|follow-up suggestions|"
+    r"start a new topic|ask a follow-up|not sure|learn more|to help narrow|"
+    r"what is your core|map data|looking for (?:job|office|a|the)|"
+    r"is this answer|also (?:consider|try|check|see)|double[- ]?check|"
+    r"table_title:|table_content:)",
+    re.I,
+)
+
+_AI_DATE_LINE_RE = re.compile(
+    r"^\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{2,4}\b",
+    re.I,
+)
+
+_AI_ATTRIBUTION_LINE_RE = re.compile(
+    r"^(?:"
+    r"[+]\d[\d\s().-]{0,16}"                    # phone-number citation chips
+    r"|"
+    r"(?:Justdial|Sulekha|IndiaMART|Practo|UrbanClap|Urban Company|"
+    r"LinkedIn|Facebook|Instagram|YouTube|Wikipedia|Yellow Pages|"
+    r"AskLaila|BharatBizz?|India Business Directory|Hotfrog|Yelp|"
+    r"Naukri(?:\.com)?|ZaubaCorp|Indeed|Glassdoor|Shine|Monster|"
+    r"GoodFirms?|Clutch)"
+    r"|"
+    r"[A-Za-z][\w .&'()-]{1,40}?\s+India"       # "LinkedIn India" style chips
+    r")$",
+    re.I,
+)
+
+
+def _clean_ai_text(text: str) -> str:
+    """Remove citation attribution chips (e.g. 'Justdial', '+1', 'LinkedIn
+    India') and cut everything from follow-up/disclaimer lines onward, so the
+    AI answer shown to the user is just the business content."""
+    lines_out = []
+    for ln in (text or "").split("\n"):
+        s = " ".join(ln.strip().split())
+        if not s:
+            continue
+        if _AI_TRAILING_CUT_RE.match(s):
+            break
+        if _AI_ATTRIBUTION_LINE_RE.match(s):
+            continue
+        if _AI_DATE_LINE_RE.match(s):
+            continue
+        lines_out.append(s)
+    return "\n".join(lines_out)
 
 
 async def _google_ai_overview(page) -> str:
@@ -551,40 +621,9 @@ async def _ai_mode_completed(page) -> bool:
         return False
 
 
-async def _google_ai_mode_answer(page, query: str) -> str:
-    """Go to Google AI Mode and capture the streamed AI answer.
-
-    AI Mode answers stream progressively, and the per-business sections (e.g.
-    'Verified Local ... Agencies') land at the very END of the answer. So we
-    keep polling until the response actually finishes (Google shows the
-    'response is ready' chip / a follow-up prompt), scrolling the page so the
-    late sections load, and we do NOT truncate the captured text early. If
-    Google reports no AI answer at all, fall back to the regular AI Overview.
-    """
-    clicked = False
-    try:
-        tab = page.locator("a").filter(has_text="AI Mode").first
-        if await tab.count():
-            try:
-                await tab.scroll_into_view_if_needed(timeout=3000)
-            except Exception:
-                pass
-            await tab.click(timeout=6000)
-            clicked = True
-    except Exception:
-        clicked = False
-
-    if not clicked:
-        try:
-            await page.goto(
-                f"https://www.google.com/search?q={urllib.parse.quote(query)}&udm=50",
-                wait_until="domcontentloaded",
-                timeout=30000,
-            )
-            clicked = True
-        except Exception:
-            return ""
-
+async def _capture_ai_mode_answer(page, query: str) -> str:
+    """Poll the AI Mode page until the streamed answer finishes, then return
+    the cleaned answer text ('' if the page is not on AI Mode)."""
     text = ""
     last_len = -1
     stable = 0
@@ -643,37 +682,159 @@ async def _google_ai_mode_answer(page, query: str) -> str:
     for prefix in ("AI Mode", "AI Overview"):
         if text.startswith(prefix):
             text = text[len(prefix):].strip()
+    return _clean_ai_text(text)
+
+
+async def _google_ai_mode_answer(page, query: str) -> str:
+    """Go to Google AI Mode and capture the streamed AI answer.
+
+    AI Mode answers stream progressively, and the per-business sections (e.g.
+    'Verified Local ... Agencies') land at the very END of the answer. So we
+    keep polling until the response actually finishes (Google shows the
+    'response is ready' chip / a follow-up prompt), scrolling the page so the
+    late sections load, and we do NOT truncate the captured text early. If
+    Google reports no AI answer at all, fall back to the regular AI Overview.
+    """
+    clicked = False
+    try:
+        tab = page.locator("a").filter(has_text="AI Mode").first
+        if await tab.count():
+            try:
+                await tab.scroll_into_view_if_needed(timeout=3000)
+            except Exception:
+                pass
+            await tab.click(timeout=6000)
+            clicked = True
+    except Exception:
+        clicked = False
+
+    if not clicked:
+        try:
+            await page.goto(
+                f"https://www.google.com/search?q={urllib.parse.quote(query)}&udm=50",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            clicked = True
+        except Exception:
+            return ""
+
+    text = await _capture_ai_mode_answer(page, query)
     return text[:100000] if clicked and text else ""
 
 
-def _unnest_google_url(href: str) -> str:
-    """Google result anchors sometimes point to /url?q=<real-url> redirects;
-    pull the real destination out so we visit the site directly."""
-    if "google.com" in href and ("/url" in href or "url?q" in href):
-        m = re.search(r"[?&]q=([^&]+)", href)
-        if m:
-            return urllib.parse.unquote(m.group(1))
-    return href
+_LOOKUP_ADDR_PATTERN = re.compile(
+    r"(?:address\s*(?::|is)\s*|located\s+(?:at|on|in)\s*|situated\s+(?:at|on|in)\s*|"
+    r"based\s+(?:in|at)\s*)(.+)",
+    re.I,
+)
 
 
-async def _google_result_links(page) -> list[tuple[str, str]]:
-    links: list[tuple[str, str]] = []
+def _extract_lookup_address(t: str) -> str:
+    """Pull an address out of an AI Mode lookup answer, stopping at the next
+    field label / a comma that starts a lowercase clause / a sentence
+    boundary (while keeping abbreviations like 'No.' intact)."""
+    m = _LOOKUP_ADDR_PATTERN.search(t or "")
+    if not m:
+        return ""
+    tail = re.split(
+        r"\s+(?:phone|email|contact|timing|open|closes|website|rating)\b",
+        m.group(1), flags=re.I)[0]
+    parts = [p.strip() for p in tail.split(",")]
+    kept = [parts[0]]
+    for p in parts[1:]:
+        if p and p[0].isupper():
+            kept.append(p)
+        else:
+            break
+    addr = ", ".join(kept).strip(" .")
+    for mm in re.finditer(r"\.\s+[A-Z][a-z]", addr):
+        prev = re.search(r"([A-Za-z]+)\s*$", addr[:mm.start()])
+        if prev and prev.group(1).lower() in (
+                "no", "st", "rd", "dr", "ltd", "pvt", "inc", "sr", "jr",
+                "vs", "etc", "mr", "mrs", "ms", "e", "g"):
+            continue
+        addr = addr[:mm.start()]
+        break
+    addr = re.split(r"\s+\([a-z]", addr)[0]
+    addr = re.split(
+        r"\s+(?:and\s+neighboring|frequently|often|sometimes|"
+        r"usually|typically|per|according\s+to)\b",
+        addr, flags=re.I)[0]
+    addr = addr.strip(" .")
+    if addr.lower().startswith("the "):
+        addr = addr[4:].strip()
+    return addr
+
+
+def _extract_lookup_fields(text: str) -> dict:
+    """Pull rating / reviews / phone / email / address out of an AI Mode
+    answer for a '<business> rating phone email address' style query."""
+    t = text or ""
+    fields: dict[str, str] = {}
+    rm = re.search(
+        r"(?:rating\s+(?:of|is)\s+|rated\s+|rating:\s*)(\d(?:\.\d)?)"
+        r"\s*(?:out\s+of\s*5|/5|\bstar)", t, re.I)
+    if not rm:
+        rm = re.search(r"\b(\d(?:\.\d)?)\s*/\s*5\b", t)
+    if rm:
+        fields["rating"] = rm.group(1)
+    vm = re.search(r"(\d[\d,]*\.?\d*[Kk]?)\s*(?:Google\s+)?reviews?\b", t, re.I)
+    if vm:
+        fields["reviews"] = vm.group(1)
+    phones = _clean_phones(set(_PHONE_RE.findall(t)))
+    if phones:
+        fields["phone"] = phones[0]
+    emails = _clean_emails(set(_EMAIL_RE.findall(t)))
+    if emails:
+        fields["email"] = emails[0]
+    addr = _extract_lookup_address(t)
+    if addr:
+        fields["address"] = addr
+    return fields
+
+
+async def _ai_mode_lookup(page, business: str, loc: str) -> dict:
+    """Search '<business> <loc> rating phone email address' in Google AI Mode
+    and extract the business details from the answer."""
+    query = " ".join(x for x in (business, loc) if x)
+    query = f"{query} rating phone email address"
+    print(f"[browser]  - AI Mode lookup: {query!r}")
     try:
-        nodes = page.locator("a:has(h3)")
-        count = await nodes.count()
-        for i in range(count):
-            try:
-                title = (await nodes.nth(i).locator("h3").inner_text()).strip()
-                href = await nodes.nth(i).get_attribute("href")
-            except Exception:
-                continue
-            if title and href and href.startswith("http"):
-                href = _unnest_google_url(href)
-                if "google.com" not in href:
-                    links.append((title, href))
-    except Exception:
-        pass
-    return links
+        await page.goto(
+            f"https://www.google.com/search?q={urllib.parse.quote(query)}&udm=50",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        text = await _capture_ai_mode_answer(page, query)
+    except Exception as exc:
+        print(f"[browser]  - AI Mode lookup error: {type(exc).__name__}: {exc}")
+        return {}
+    return _extract_lookup_fields(text)
+
+
+async def _ai_mode_lookup_businesses(
+    page, leads: list[dict], query: str, max_results: int,
+) -> None:
+    """For every business parsed from the AI answer, run one combined AI Mode
+    lookup ('<name> <loc> rating phone email address') and merge rating /
+    reviews / phone / email / address into the lead."""
+    loc = ""
+    m = re.match(r"^.*?\s+(?:in|at|near|nearby)\s+(.+)$", query, re.I)
+    if m:
+        loc = m.group(1).strip()
+    for i, lead in enumerate(leads[:max_results], 1):
+        name = (lead.get("business_name") or "").strip()
+        if not name:
+            continue
+        print(f"[browser] ({i}/{min(len(leads), max_results)}) AI Mode "
+              f"detail lookup for: {name}")
+        info = await _ai_mode_lookup(page, name, loc)
+        for k in ("rating", "reviews", "phone", "email", "address"):
+            v = info.get(k)
+            if v:
+                lead[k] = v
+        await asyncio.sleep(0.5)
 
 
 async def _google_search(page, query: str, slow_mo: int) -> bool:
@@ -736,128 +897,6 @@ def _refined_query(query: str) -> str:
     return f"top 10 {q}"
 
 
-_GENERIC_JUNK_URL_RE = re.compile(
-    r"(?:/jobs?/?|/careers?/?|/job-listing|/company-reviews|/reviews?/?|"
-    r"/companies?/?|/opportunities/?|/vacanc|/hiring|/apply|/recruit|"
-    r"/salary|/interview|/employer)",
-    re.I,
-)
-_GENERIC_JUNK_TITLE_RE = re.compile(
-    r"\b(?:job|jobs|vacanc|opening|hiring|recruit|salary|interview|"
-    r"reviews?|rating|profile|directory|listing|job-listing|company-review|"
-    r"glassdoor|indeed|naukri)\b",
-    re.I,
-)
-
-
-def _pick_official_site(
-    links: list[tuple[str, str]], name: str,
-) -> tuple[str, str, bool] | None:
-    """Pick the business's own website from Google results for its name.
-
-    Prefers a link whose hostname contains a token from the business name
-    (e.g. 'ccs' -> ccsrealestates.com). Otherwise falls back to the first
-    result that is not a directory / job board / social / news page. Returns
-    (title, url, is_hostname_match).
-    """
-    name_tokens = {
-        w for w in re.findall(r"[a-z0-9]{3,}", name.lower())
-        if w not in {"real", "estate", "estates", "properties", "property",
-                     "group", "limited", "private", "pvt", "ltd", "llp",
-                     "the", "and", "consultancy", "consultant", "consultants",
-                     "enterprises", "enterprise", "trading", "solutions",
-                     "services", "infra", "developers", "developer"}
-    }
-    first_ok = None
-    for title, url in links[:12]:
-        if _is_junk_source(title, url):
-            continue
-        try:
-            host = (url.split("/")[2] or "").lower()
-        except IndexError:
-            host = ""
-        if host.startswith("www."):
-            host = host[4:]
-        if "google." in host or host.startswith("maps"):
-            continue
-        if _GENERIC_JUNK_URL_RE.search(url):
-            continue
-        if _GENERIC_JUNK_TITLE_RE.search(title or ""):
-            continue
-        if first_ok is None:
-            first_ok = (title, url)
-        if name_tokens and any(tok in host for tok in name_tokens):
-            return (title, url, True)
-    if first_ok:
-        return (first_ok[0], first_ok[1], False)
-    return None
-
-
-async def _visit_business_sites(
-    page, leads: list[dict], query: str, slow_mo: int, max_results: int,
-) -> None:
-    """For each business parsed from the AI answer, search its exact name on
-    Google, open its official website (first organic result), and pull the
-    phone / email / website straight from that site. This is the ONLY page
-    type we visit - we do not crawl random source/portal links."""
-    loc = ""
-    m = re.match(r"^.*?\s+(?:in|at|near|nearby)\s+(.+)$", query, re.I)
-    if m:
-        loc = m.group(1).strip()
-    for i, lead in enumerate(leads[:max_results], 1):
-        name = (lead.get("business_name") or "").strip()
-        if not name:
-            continue
-        queries = [name]
-        if loc:
-            queries.append(f"{name} {loc}")
-        queries.append(f"{name} official website")
-        print(f"[browser] ({i}/{min(len(leads), max_results)}) Searching "
-              f"official site of: {name}")
-        try:
-            best = None
-            for attempt, site_query in enumerate(queries):
-                ok = await _google_search(page, site_query, slow_mo)
-                if not ok:
-                    break
-                await asyncio.sleep(1)
-                links = await _google_result_links(page)
-                picked = _pick_official_site(links, name)
-                if not picked:
-                    continue
-                title, url, matched = picked
-                if matched:
-                    best = (title, url)
-                    break
-                if best is None or attempt == len(queries) - 1:
-                    best = (title, url)
-            if not best:
-                print(f"[browser]  - no official website found for {name}")
-                continue
-            title, url = best
-            print(f"[browser]  - visiting: {url}")
-            await page.goto(url, wait_until="domcontentloaded", timeout=25000)
-            await asyncio.sleep(0.8)
-            info = await _extract_from_page(page, url, name)
-            for k in ("website", "email", "phone", "emails", "phones"):
-                if info.get(k):
-                    lead[k] = info[k]
-            if not lead.get("description") and info.get("description"):
-                lead["description"] = info["description"]
-            if not lead.get("source"):
-                try:
-                    host = (url.split("/")[2] or "").lower()
-                except IndexError:
-                    host = ""
-                if host.startswith("www."):
-                    host = host[4:]
-                lead["source"] = [host]
-        except Exception as exc:
-            print(f"[browser]  - error looking up {name}: "
-                  f"{type(exc).__name__}: {exc}")
-        await asyncio.sleep(0.5)
-
-
 async def _google_ai_search(
     query: str, max_results: int, slow_mo: int,
 ) -> dict:
@@ -918,6 +957,7 @@ async def _google_ai_search(
             if not ai_text:
                 ai_text = ai_overview
             if ai_text:
+                ai_text = _clean_ai_text(ai_text)
                 print(f"[browser] AI answer scraped ({len(ai_text)} chars)")
             else:
                 print("[browser] No answer text visible on the AI mode page.")
@@ -940,6 +980,15 @@ async def _google_ai_search(
                             print(f"[browser] Refined query yielded "
                                   f"{len(card_leads)} business record(s)")
 
+            try:
+                with open(os.path.join(_BASE_DIR, "ai_debug.txt"), "w",
+                          encoding="utf-8") as _f:
+                    _f.write(ai_text)
+                print(f"[debug] Raw AI text saved to ai_debug.txt "
+                      f"({len(ai_text)} chars)")
+            except Exception as _e:
+                print(f"[debug] Could not save ai_debug.txt: {_e}")
+
             if card_leads:
                 seen = {c["business_name"].lower() for c in leads}
                 uniq = [c for c in card_leads
@@ -951,11 +1000,11 @@ async def _google_ai_search(
                 print("[browser] No business records parsed from the AI answer.")
 
             if leads:
-                print(f"[browser] Visiting the official website of "
+                print(f"[browser] Running AI Mode detail lookups for "
                       f"{min(len(leads), max_results)} business(es) to grab "
-                      "phone / email / website")
-                await _visit_business_sites(page, leads, query, slow_mo,
-                                            max_results)
+                      "rating / phone / email / address")
+                await _ai_mode_lookup_businesses(page, leads, query,
+                                                 max_results)
             else:
                 print("[browser] No business records to enrich - "
                       "skipping website visits.")
