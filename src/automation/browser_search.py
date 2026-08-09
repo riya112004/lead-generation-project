@@ -75,12 +75,13 @@ def _clean_phones(raw: set) -> list[str]:
 
 
 _CARD_RE = re.compile(
-    r"(?ms)^(?P<name>[^\n]{3,80})\n"
-    r"(?P<rating>\d(?:\.\d)?)\n"
-    r"(?P<reviews>\(\d[\d,]*\.?\d*[Kk]?\))\n"
+    r"(?ms)^(?P<name>[^\n:]{3,80})\n"
+    r"(?:(?P<rating>\d(?:\.\d)?)\n(?P<reviews>\(\d[\d,]*\.?\d*[Kk]?\))\n)?"
     r"(?P<category>[^\n]{2,40})\n"
-    r"(?P<open>Open[^\n]*)\n"
-    r"(?P<body>.*?)(?=\n[^\n]{3,80}\n\d(?:\.\d)?\n\(\d[\d,]*|\Z)"
+    r"(?P<open>(?:Open|Closed|Closes)[^\n]*)\n"
+    r"(?P<body>.*?)(?=\n[^\n:]{3,80}\n"
+    r"(?:(?:\d(?:\.\d)?\n\(\d[\d,]*\.?\d*[Kk]?\)\n)?)"
+    r"(?:[^\n]{2,40})\n(?:Open|Closed|Closes)|\Z)"
 )
 
 _PROSE_RE = re.compile(
@@ -114,7 +115,7 @@ _CONTINUATION_CUT_RE = re.compile(
 
 # Lines that are headings / table rows / prose, never business names.
 _NAME_SKIP_RE = re.compile(
-    r"^(?:top[-\s]?rated|top|if you|are you|you can|map data|terms|"
+    r"^(?:timings?\s*[:.]\s*|top[-\s]?rated|top|if you|are you|you can|map data|terms|"
     r"location\s*/\s*zone|property (?:in|rates)|for sale|for rent|"
     r"average|dominant|the luxury|periphery|central|southern|high rental|"
     r"in 20\d\d|price|price per|₹|overview|metrics|verified|featured|"
@@ -363,7 +364,8 @@ def _parse_ai_business_cards(ai_text: str) -> list[dict]:
         body = _cut_card_body(m.group("body") or "")
         fields = {}
         for key, label in (("address", "Address"), ("address", "Location"),
-                           ("timing", "Timing"), ("services", "Services"),
+                           ("timing", "Timing"), ("timing", "Timings"),
+                           ("services", "Services"),
                            ("highlights", "Highlights")):
             fm = re.search(rf"^{label}:\s*(.*)$", body, re.M)
             if fm:
@@ -398,8 +400,8 @@ def _parse_ai_business_cards(ai_text: str) -> list[dict]:
                     address = rest
         leads.append({
             "business_name": name,
-            "rating": m.group("rating"),
-            "reviews": m.group("reviews"),
+            "rating": m.group("rating") or "",
+            "reviews": m.group("reviews") or "",
             "category": category_raw,
             "price_range": price_range,
             "status": status,
@@ -498,44 +500,67 @@ _AI_ANSWER_JS = """(query) => {
     if (hdr >= 0) t = t.slice(hdr);
     const q = query.replace(/[?.!,]/g, '').toLowerCase().trim();
     const lines = t.split('\\n').map(s => s.trim()).filter(s => s);
+    const CUT = ['Ask a follow-up', 'Suggested follow-up', 'Follow-up suggestions',
+                 'Related searches', 'More to explore', 'Feedback', 'Report an issue',
+                 'Start a new topic', 'If you are looking', 'Are you looking',
+                 'AI can make mistakes', 'Show all', 'AI Mode response is ready',
+                 'To help narrow down', 'What is your core objective'];
     const out = [];
+    let i = 0;
     let started = false;
-    for (const line of lines) {
-        const clean = line.replace(/[?.!,]/g, '').toLowerCase().trim();
-        if (!started) {
-            if (clean === q) { started = true; }
-            continue;
+    for (i = 0; i < lines.length; i++) {
+        const clean = lines[i].replace(/[?.!,]/g, '').toLowerCase().trim();
+        if (clean === q || clean.indexOf(q) === 0) { started = true; break; }
+    }
+    if (started) {
+        i += 1;
+    } else {
+        i = 0;
+        for (i = 0; i < lines.length; i++) {
+            const low = lines[i].toLowerCase().trim();
+            if (low === 'searching') continue;
+            break;
         }
-        if (line.toLowerCase().trim() === 'searching') continue;
+    }
+    const qFirst = q.split(' ')[0];
+    for (let j = i; j < lines.length; j++) {
+        const line = lines[j];
+        const low = line.toLowerCase().trim();
+        if (low === 'searching') continue;
+        if (!started && (low === q || low.indexOf(q) === 0
+                         || (line.length < 60 && low.indexOf(qFirst) === 0))) continue;
         let cut = false;
-        for (const m of ['Ask a follow-up', 'Suggested follow-up', 'Follow-up suggestions',
-                         'Related searches', 'More to explore', 'Feedback', 'Report an issue',
-                         'Start a new topic', 'If you are looking', 'Are you looking',
-                         'AI can make mistakes', 'Show all', 'AI Mode response is ready',
-                         'To help narrow down', 'What is your core objective']) {
+        for (const m of CUT) {
             if (line.indexOf(m) === 0) { cut = true; break; }
         }
         if (cut) break;
         out.push(line);
     }
     const junk = /not available for this search|can't generate an ai overview|try again later|error translating content|हिन्दी|हिंदी/i;
-    const cleaned = out.filter((ln, i) => !(i < 6 && junk.test(ln)));
+    const cleaned = out.filter((ln, k) => !(k < 6 && junk.test(ln)));
     return cleaned.join('\\n');
 }"""
 
 _AI_OVERVIEW_JS = """() => {
-    const cands = document.querySelectorAll('[data-md="516"]');
-    if (cands.length) return cands[0].innerText || '';
     const t = (document.body.innerText || '').replace(/\\u00a0/g, ' ');
     if (/AI Overview is not available/i.test(t)) return '__unavailable__';
-    const idx = t.indexOf('AI Overview');
-    if (idx >= 0) {
-        let slice = t.slice(idx);
-        for (const m of ['Related searches', 'People also ask', 'Feedback']) {
-            const j = slice.indexOf(m);
-            if (j > 0) return slice.slice(0, j);
+    let best = '';
+    document.querySelectorAll('div[data-md]').forEach(d => {
+        const md = d.getAttribute('data-md');
+        const txt = d.innerText || '';
+        if (/^51[0-9]$/.test(md) && txt.length > best.length) best = txt;
+    });
+    if (best) return best;
+    for (const mk of ['AI Overview', 'AI overview', 'Generative AI is experimental']) {
+        const idx = t.indexOf(mk);
+        if (idx >= 0) {
+            let slice = t.slice(idx);
+            for (const m of ['Related searches', 'People also ask', 'Feedback', 'Report an issue']) {
+                const j = slice.indexOf(m);
+                if (j > 0) { slice = slice.slice(0, j); break; }
+            }
+            return slice;
         }
-        return slice;
     }
     return '';
 }"""
@@ -981,11 +1006,18 @@ async def _google_ai_search(
                                   f"{len(card_leads)} business record(s)")
 
             try:
+                raw_page = ai_text
+                if not raw_page:
+                    try:
+                        raw_page = await page.evaluate(
+                            "() => document.body.innerText || ''")
+                    except Exception:
+                        raw_page = ""
                 with open(os.path.join(_BASE_DIR, "ai_debug.txt"), "w",
                           encoding="utf-8") as _f:
-                    _f.write(ai_text)
+                    _f.write(raw_page)
                 print(f"[debug] Raw AI text saved to ai_debug.txt "
-                      f"({len(ai_text)} chars)")
+                      f"({len(raw_page)} chars)")
             except Exception as _e:
                 print(f"[debug] Could not save ai_debug.txt: {_e}")
 
@@ -1015,6 +1047,11 @@ async def _google_ai_search(
                 pass
 
     print(f"[browser] Done. Scraped the AI mode answer ({len(ai_text)} chars).")
+    for _lead in leads:
+        for _k in ("timing", "services", "highlights", "website", "email",
+                   "phone", "rating", "reviews", "category", "price_range",
+                   "status", "address", "description"):
+            _lead.setdefault(_k, "")
     return {
         "query": query,
         "engine": "google-ai",
