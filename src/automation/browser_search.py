@@ -472,6 +472,99 @@ _USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
+_browser_session = {
+    "playwright": None,
+    "context": None,
+    "page": None,
+}
+_browser_lock = asyncio.Lock()
+_search_lock = asyncio.Lock()
+_browser_idle_task = None
+_browser_last_used = 0.0
+_browser_in_use = False
+_BROWSER_IDLE_SECONDS = 180.0
+
+
+def _launch_kwargs(slow_mo: int) -> dict:
+    launch_kwargs = {
+        "headless": False,
+        "slow_mo": slow_mo,
+        "viewport": {"width": 1440, "height": 900},
+        "locale": "en-US",
+        "user_agent": _USER_AGENT,
+        "args": ["--disable-blink-features=AutomationControlled"],
+        "ignore_default_args": ["--enable-automation"],
+    }
+    if _chrome_channel():
+        launch_kwargs["channel"] = "chrome"
+    return launch_kwargs
+
+
+async def _ensure_browser(slow_mo: int):
+    """Reuse the persistent Chrome session; launch a fresh one only if needed."""
+    global _browser_session, _browser_last_used
+    async with _browser_lock:
+        ctx = _browser_session["context"]
+        if ctx is None or ctx.is_closed():
+            if _browser_session["playwright"] is not None:
+                try:
+                    await _browser_session["playwright"].stop()
+                except Exception:
+                    pass
+            p = await async_playwright().start()
+            ctx = await p.chromium.launch_persistent_context(
+                _PROFILE_DIR, **_launch_kwargs(slow_mo))
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            _browser_session = {"playwright": p, "context": ctx, "page": page}
+            print("[browser] Opened Chrome window (persistent profile) - "
+                  "it stays open for the next query.")
+        _browser_last_used = time.monotonic()
+        return _browser_session["page"]
+
+
+async def _close_browser() -> None:
+    global _browser_session
+    async with _browser_lock:
+        if _browser_in_use:
+            return
+        ctx = _browser_session["context"]
+        if ctx is not None and not ctx.is_closed():
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+        p = _browser_session["playwright"]
+        if p is not None:
+            try:
+                await p.stop()
+            except Exception:
+                pass
+        _browser_session = {"playwright": None, "context": None, "page": None}
+
+
+async def _browser_idle_watch() -> None:
+    """Close Chrome when no new query arrives within _BROWSER_IDLE_SECONDS."""
+    global _browser_last_used, _browser_in_use
+    while True:
+        await asyncio.sleep(15)
+        idle = False
+        async with _browser_lock:
+            if _browser_in_use:
+                continue
+            ctx = _browser_session["context"]
+            if ctx is None or ctx.is_closed():
+                continue
+            idle = (time.monotonic() - _browser_last_used >= _BROWSER_IDLE_SECONDS)
+        if idle:
+            print("[browser] No new query for 3 minutes - closing Chrome.")
+            await _close_browser()
+
+
+def _start_idle_watch() -> None:
+    global _browser_idle_task
+    if _browser_idle_task is None or _browser_idle_task.done():
+        _browser_idle_task = asyncio.create_task(_browser_idle_watch())
+
 
 async def _dismiss_google_consent(page) -> None:
     try:
@@ -862,6 +955,85 @@ async def _ai_mode_lookup_businesses(
         await asyncio.sleep(0.5)
 
 
+async def _is_ai_mode_page(page) -> bool:
+    """True when the current page is still showing the Google AI Mode chat."""
+    try:
+        return bool(await page.evaluate(
+            """() => {
+                const t = document.body.innerText || '';
+                if (t.indexOf('AI Mode conversation') >= 0) return true;
+                if (t.indexOf('Ask a follow-up') >= 0) return true;
+                if (t.indexOf('AI Mode response is ready') >= 0) return true;
+                return !!document.querySelector(
+                    'a[aria-label*="AI Mode" i], a[role="tab"][aria-label*="AI Mode" i]');
+            }"""
+        ))
+    except Exception:
+        return False
+
+
+async def _google_ai_followup(page, query: str) -> bool:
+    """Type the next query into the open AI Mode chat composer.
+
+    Keeps the same AI Mode conversation going (like 'give me more...') instead
+    of navigating to a fresh search. Returns False when no composer is
+    available, so the caller can fall back to a normal search.
+    """
+    try:
+        found = await page.evaluate(
+            """() => {
+                const nodes = [];
+                const sels = [
+                    'div[contenteditable="true"]',
+                    'textarea',
+                ];
+                for (const sel of sels) {
+                    for (const el of document.querySelectorAll(sel)) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width < 40 || r.height < 12) continue;
+                        const cs = getComputedStyle(el);
+                        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+                        const hint = (((el.getAttribute && el.getAttribute('aria-label')) || '')
+                                     + ' ' + ((el.getAttribute && el.getAttribute('placeholder')) || ''))
+                                    .toLowerCase();
+                        let score = 0;
+                        if (el.isContentEditable) score += 10;
+                        else if (el.tagName === 'TEXTAREA') score += 8;
+                        if (/follow|ask|question|search|message|type/.test(hint)) score += 20;
+                        nodes.push({ el: el, score: score, top: r.top });
+                    }
+                }
+                if (!nodes.length) return false;
+                nodes.sort((a, b) => (b.score - a.score) || (b.top - a.top));
+                const el = nodes[0].el;
+                if (el.isContentEditable) el.textContent = '';
+                else if (typeof el.value === 'string') el.value = '';
+                el.focus();
+                return true;
+            }"""
+        )
+        if not found:
+            print("[browser] No AI Mode follow-up box found - running a fresh search.")
+            return False
+        await page.keyboard.type(query, delay=60)
+        await page.keyboard.press("Enter")
+        await asyncio.sleep(2)
+        submitted = await page.evaluate(
+            """() => {
+                for (const el of document.querySelectorAll(
+                         'div[contenteditable="true"], textarea, input[type="text"]')) {
+                    const v = (el.value !== undefined ? el.value
+                               : (el.textContent || '')).trim();
+                    if (v) return false;
+                }
+                return true;
+            }"""
+        )
+        return submitted
+    except Exception:
+        return False
+
+
 async def _google_search(page, query: str, slow_mo: int) -> bool:
     """Type query + Enter on Google. Returns False if Google blocked the request."""
     await page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=30000)
@@ -935,55 +1107,61 @@ async def _google_ai_search(
     errors: list[str] = []
     leads: list[dict] = []
 
-    launch_kwargs = {
-        "headless": False,
-        "slow_mo": slow_mo,
-        "viewport": {"width": 1440, "height": 900},
-        "locale": "en-US",
-        "user_agent": _USER_AGENT,
-        "args": ["--disable-blink-features=AutomationControlled"],
-        "ignore_default_args": ["--enable-automation"],
-    }
-    if _chrome_channel():
-        launch_kwargs["channel"] = "chrome"
-
-    print(f"[browser] Opening Chrome (persistent profile) for Google AI search: {query!r}")
-    print(f"[browser] Profile: {_PROFILE_DIR}")
-    async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(_PROFILE_DIR, **launch_kwargs)
-        page = context.pages[0] if context.pages else await context.new_page()
+    _start_idle_watch()
+    _browser_in_use = True
+    _browser_last_used = time.monotonic()
+    try:
+        page = await _ensure_browser(slow_mo)
+        print(f"[browser] Running Google AI search in the open window: {query!r}")
         try:
-            blocked = not await _google_search(page, query, slow_mo)
-            if blocked:
-                print("[browser] Google asked for verification - solve the CAPTCHA / sign in "
-                      "in the window now, the search will continue automatically.")
-                deadline = time.monotonic() + 300
-                while time.monotonic() < deadline:
-                    await asyncio.sleep(2)
-                    try:
-                        if "sorry/index" not in page.url:
-                            break
-                        if "unusual traffic" not in await page.content():
-                            break
-                    except Exception:
-                        break
-                if not await _google_search(page, query, slow_mo):
-                    msg = ("Google still blocked the request. Make sure you are signed in "
-                           "to Google in the profile window, then run again.")
-                    print("[browser] " + msg)
-                    return {
-                        "query": query, "engine": "google-ai", "total_results": 0,
-                        "results": [], "errors": [msg],
-                    }
+            followup = bool(_browser_session.get("followup"))
+            if followup and not await _is_ai_mode_page(page):
+                print("[browser] Page left AI Mode - starting a fresh AI Mode search.")
+                followup = False
+                _browser_session["followup"] = False
+            if followup:
+                used_followup = await _google_ai_followup(page, query)
+                if used_followup:
+                    print(f"[browser] Follow-up sent in the open AI Mode chat: {query!r}")
+            else:
+                used_followup = False
 
-            ai_overview = await _google_ai_overview(page)
+            if not used_followup:
+                blocked = not await _google_search(page, query, slow_mo)
+                if blocked:
+                    print("[browser] Google asked for verification - solve the CAPTCHA / sign in "
+                          "in the window now, the search will continue automatically.")
+                    deadline = time.monotonic() + 300
+                    while time.monotonic() < deadline:
+                        await asyncio.sleep(2)
+                        try:
+                            if "sorry/index" not in page.url:
+                                break
+                            if "unusual traffic" not in await page.content():
+                                break
+                        except Exception:
+                            break
+                    if not await _google_search(page, query, slow_mo):
+                        msg = ("Google still blocked the request. Make sure you are signed in "
+                               "to Google in the profile window, then run again.")
+                        print("[browser] " + msg)
+                        return {
+                            "query": query, "engine": "google-ai", "total_results": 0,
+                            "results": [], "errors": [msg],
+                        }
 
-            ai_text = await _google_ai_mode_answer(page, query)
-            if not ai_text:
-                ai_text = ai_overview
+                ai_overview = await _google_ai_overview(page)
+
+                ai_text = await _google_ai_mode_answer(page, query)
+                if not ai_text:
+                    ai_text = ai_overview
+            else:
+                ai_text = await _capture_ai_mode_answer(page, query)
+
             if ai_text:
                 ai_text = _clean_ai_text(ai_text)
                 print(f"[browser] AI answer scraped ({len(ai_text)} chars)")
+                _browser_session["followup"] = True
             else:
                 print("[browser] No answer text visible on the AI mode page.")
 
@@ -1041,10 +1219,11 @@ async def _google_ai_search(
                 print("[browser] No business records to enrich - "
                       "skipping website visits.")
         finally:
-            try:
-                await context.close()
-            except Exception:
-                pass
+            print("[browser] Query finished - keeping Chrome window open "
+                  "for the next query (closes after 3 min idle).")
+    finally:
+        _browser_in_use = False
+        _browser_last_used = time.monotonic()
 
     print(f"[browser] Done. Scraped the AI mode answer ({len(ai_text)} chars).")
     for _lead in leads:
@@ -1067,4 +1246,5 @@ async def search_and_scrape(
     slow_mo: int = 250,
 ) -> dict:
     """Run the visible Google AI mode automation. Returns lead dicts."""
-    return await _google_ai_search(query, max_results, slow_mo)
+    async with _search_lock:
+        return await _google_ai_search(query, max_results, slow_mo)
