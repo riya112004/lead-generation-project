@@ -973,7 +973,7 @@ async def _google_ai_search(
                     print("[browser] " + msg)
                     return {
                         "query": query, "engine": "google-ai", "total_results": 0,
-                        "results": [], "errors": [msg], "ai_overview": "",
+                        "results": [], "errors": [msg],
                     }
 
             ai_overview = await _google_ai_overview(page)
@@ -1058,7 +1058,6 @@ async def _google_ai_search(
         "total_results": len(leads),
         "results": leads,
         "errors": errors,
-        "ai_overview": ai_text,
     }
 
 
