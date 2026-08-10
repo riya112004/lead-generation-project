@@ -487,7 +487,7 @@ _BROWSER_IDLE_SECONDS = 180.0
 
 def _launch_kwargs(slow_mo: int) -> dict:
     launch_kwargs = {
-        "headless": False,
+        "headless": True,
         "slow_mo": slow_mo,
         "viewport": {"width": 1440, "height": 900},
         "locale": "en-US",
